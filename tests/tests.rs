@@ -1,7 +1,10 @@
 use std::{fs, process::Command};
 
 use assert_cmd::prelude::*;
-use kvs::{KvStore, KvsError, Result};
+use kvs::{
+    Error, Result,
+    engines::{KvStore, KvsEngine},
+};
 use predicates::{
     ord::eq,
     str::{PredicateStrExt, contains, is_empty},
@@ -608,7 +611,7 @@ fn get_nonexistent_key_nonempty_store() -> Result<()> {
 fn remove_nonexistent_key_empty_store() {
     let (mut store, _dir) = open_temp_store();
     let err = store.remove("nonexistent".into()).unwrap_err();
-    assert!(matches!(err, KvsError::KeyNotFound));
+    assert!(matches!(err, Error::KeyNotFound));
 }
 
 #[test]
@@ -616,7 +619,7 @@ fn remove_nonexistent_key_nonempty_store() -> Result<()> {
     let (mut store, _dir) = open_temp_store();
     store.set("a".into(), "1".into())?;
     let err = store.remove("b".into()).unwrap_err();
-    assert!(matches!(err, KvsError::KeyNotFound));
+    assert!(matches!(err, Error::KeyNotFound));
     // Existing key unaffected
     assert_eq!(store.get("a".into())?, Some("1".into()));
     Ok(())
@@ -628,7 +631,7 @@ fn double_remove_returns_key_not_found() -> Result<()> {
     store.set("k".into(), "v".into())?;
     store.remove("k".into())?;
     let err = store.remove("k".into()).unwrap_err();
-    assert!(matches!(err, KvsError::KeyNotFound));
+    assert!(matches!(err, Error::KeyNotFound));
     Ok(())
 }
 

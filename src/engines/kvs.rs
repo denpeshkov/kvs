@@ -9,13 +9,15 @@ use std::{
 use postcard::{self, Error::DeserializeUnexpectedEnd};
 use serde::{self, Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::{Error, Result, engines::KvsEngine};
 
 /// Maximum size of active log file before rotation in bytes.
 pub const MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 /// The threshold of bytes that triggers the compaction process.
 pub const COMPACTION_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+// TODO: fsync
 
 /// The `KvStore` stores string key/value pairs.
 ///
@@ -118,85 +120,6 @@ impl KvStore {
         })
     }
 
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails or compaction/rotation encounters
-    /// an I/O error.
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        if self.uncompacted_bytes > COMPACTION_THRESHOLD {
-            self.compact_logs()?;
-        } else if self.writer.stream_position()? > MAX_FILE_SIZE {
-            self.rotate_active_log()?;
-        }
-
-        let cmd = Command::Set { key, value };
-
-        let value_position = self.writer.stream_position()?;
-        postcard::to_io(&cmd, &mut self.writer)?; // FIXME: optimize with size
-        self.writer.flush()?;
-
-        let Command::Set { key, .. } = cmd else { unreachable!() }; // Move out of enum variant.
-        let value_size = self.writer.stream_position()? - value_position;
-        if let Some(old_cmd) = self
-            .index
-            .insert(key, IndexEntry { log_id: self.current_log_id, value_position, value_size })
-        {
-            self.uncompacted_bytes += old_cmd.value_size;
-        }
-        Ok(())
-    }
-
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the given key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the log file cannot be read or the entry is
-    /// corrupted.
-    #[allow(clippy::needless_pass_by_value)]
-    #[allow(clippy::missing_panics_doc)]
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        let Some(entry) = self.index.get(&key) else {
-            return Ok(None);
-        };
-
-        let reader = self.readers.get_mut(&entry.log_id).expect("reader must exist for log file");
-        reader.seek(SeekFrom::Start(entry.value_position))?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let (cmd, _) = postcard::from_io((reader, &mut vec![0u8; entry.value_size as usize]))?;
-        let Command::Set { value, .. } = cmd else {
-            return Err(crate::KvsError::UnexpectedCommandType);
-        };
-        Ok(Some(value))
-    }
-
-    /// Remove a given key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KvsError::KeyNotFound`](crate::KvsError::KeyNotFound) if the
-    /// key does not exist, or an I/O error if the write fails.
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(old_cmd) = self.index.remove(&key) {
-            let value_position = self.writer.stream_position()?;
-            postcard::to_io(&Command::Remove { key }, &mut self.writer)?;
-            self.writer.flush()?;
-
-            let value_size = self.writer.stream_position()? - value_position;
-
-            self.uncompacted_bytes += old_cmd.value_size + value_size;
-
-            return Ok(());
-        }
-        Err(crate::KvsError::KeyNotFound)
-    }
-
     fn compact_logs(&mut self) -> Result<()> {
         self.current_log_id += 1;
 
@@ -240,6 +163,87 @@ impl KvStore {
         self.readers.insert(self.current_log_id, create_reader(&new_log_path)?);
         self.writer = create_writer(&new_log_path)?;
         Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Sets the value of a string key to a string.
+    ///
+    /// If the key already exists, the previous value will be overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or compaction/rotation encounters
+    /// an I/O error.
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        if self.uncompacted_bytes > COMPACTION_THRESHOLD {
+            self.compact_logs()?;
+        } else if self.writer.stream_position()? > MAX_FILE_SIZE {
+            self.rotate_active_log()?;
+        }
+
+        let cmd = Command::Set { key, value };
+
+        let value_position = self.writer.stream_position()?;
+        postcard::to_io(&cmd, &mut self.writer)?; // FIXME: optimize with size
+        self.writer.flush()?;
+
+        let Command::Set { key, .. } = cmd else { unreachable!() }; // Move out of enum variant.
+        let value_size = self.writer.stream_position()? - value_position;
+        if let Some(old_cmd) = self
+            .index
+            .insert(key, IndexEntry { log_id: self.current_log_id, value_position, value_size })
+        {
+            self.uncompacted_bytes += old_cmd.value_size;
+        }
+        Ok(())
+    }
+
+    /// Remove a given key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvsError::KeyNotFound`](crate::KvsError::KeyNotFound) if the
+    /// key does not exist, or an I/O error if the write fails.
+    fn remove(&mut self, key: String) -> Result<()> {
+        if let Some(old_cmd) = self.index.remove(&key) {
+            let value_position = self.writer.stream_position()?;
+            postcard::to_io(&Command::Remove { key }, &mut self.writer)?;
+            self.writer.flush()?;
+
+            let value_size = self.writer.stream_position()? - value_position;
+
+            self.uncompacted_bytes += old_cmd.value_size + value_size;
+
+            return Ok(());
+        }
+        Err(Error::KeyNotFound)
+    }
+
+    /// Gets the string value of a given string key.
+    ///
+    /// Returns `None` if the given key does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log file cannot be read or the entry is
+    /// corrupted.
+    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::missing_panics_doc)]
+    fn get(&mut self, key: String) -> Result<Option<String>> {
+        let Some(entry) = self.index.get(&key) else {
+            return Ok(None);
+        };
+
+        let reader = self.readers.get_mut(&entry.log_id).expect("reader must exist for log file");
+        reader.seek(SeekFrom::Start(entry.value_position))?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let (cmd, _) = postcard::from_io((reader, &mut vec![0u8; entry.value_size as usize]))?;
+        let Command::Set { value, .. } = cmd else {
+            return Err(Error::UnexpectedCommandType);
+        };
+        Ok(Some(value))
     }
 }
 
